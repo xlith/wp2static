@@ -1,0 +1,9 @@
+output/
+*.xml
+*.sql
+*.gz
+*.wpress
+__pycache__/
+.venv/
+.git/
+.DS_Store

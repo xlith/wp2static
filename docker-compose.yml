@@ -1,0 +1,14 @@
+services:
+  wp2static:
+    image: ghcr.io/xlith/wp2static:latest
+    # build: .  # uncomment to build locally instead
+    container_name: wp2static
+    ports:
+      - "8080:80"
+    volumes:
+      - ./my-export.xml:/data/export.xml
+      - wp2static-data:/data/output
+    restart: unless-stopped
+
+volumes:
+  wp2static-data:

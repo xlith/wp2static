@@ -1,0 +1,5 @@
+output/
+*.xml
+.venv/
+__pycache__/
+.DS_Store

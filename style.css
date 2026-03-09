@@ -1,0 +1,12 @@
+/* wp2static custom overrides -- Bulma handles everything else */
+.content img {
+    border-radius: 4px;
+}
+.comment-box {
+    margin-bottom: 1rem;
+}
+.panel-block .item-date {
+    color: #888;
+    font-size: 0.85rem;
+    white-space: nowrap;
+}
