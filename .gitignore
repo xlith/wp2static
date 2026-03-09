@@ -1,5 +1,6 @@
 output/
 *.xml
+*.pyc
 .venv/
 __pycache__/
 .DS_Store

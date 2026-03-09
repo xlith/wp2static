@@ -6,7 +6,7 @@ services:
     ports:
       - "8080:80"
     volumes:
-      - ./my-export.xml:/data/export.xml
+      - ./my-export.xml:/data/export.xml  # replace with your WXR export filename
       - wp2static-data:/data/output
     restart: unless-stopped
 

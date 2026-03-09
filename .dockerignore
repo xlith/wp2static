@@ -3,7 +3,15 @@ output/
 *.sql
 *.gz
 *.wpress
+*.pyc
 __pycache__/
 .venv/
 .git/
+.github/
+.gitignore
+.dockerignore
 .DS_Store
+Dockerfile
+docker-compose.yml
+README.md
+screenshot.png

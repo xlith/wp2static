@@ -46,6 +46,27 @@ Then run:
 """.strip()
 
 
+# --- Logging ---
+VERBOSE = False
+
+
+def log(msg):
+    """Print only in verbose mode."""
+    if VERBOSE:
+        print(msg)
+
+
+def progress_bar(current, total, prefix="", width=40):
+    """Render a terminal progress bar."""
+    fraction = current / total if total else 1
+    filled = int(width * fraction)
+    bar = "█" * filled + "░" * (width - filled)
+    percent = f"{fraction * 100:5.1f}%"
+    print(f"\r  {prefix} [{bar}] {percent} ({current}/{total})", end="", flush=True)
+    if current == total:
+        print()
+
+
 # --- HTTP Session with retry ---
 def create_session():
     session = requests.Session()
@@ -73,7 +94,6 @@ def detect_site_metadata(tree):
     site_language = get_text(channel, "language") or "en"
     site_link = get_text(channel, "link") or ""
 
-    # Collect domains from channel link, base_site_url, attachment URLs, guids
     domains = set()
     if site_link:
         parsed = urlparse(site_link)
@@ -92,7 +112,6 @@ def detect_site_metadata(tree):
         if parsed.hostname:
             domains.add(parsed.hostname)
 
-    # Scan attachments and guids for additional domains
     for item in channel.findall("item"):
         for tag in ["wp:attachment_url", "guid"]:
             url = get_text(item, tag)
@@ -113,29 +132,22 @@ def detect_site_metadata(tree):
 def build_image_patterns(domains):
     """Build regex patterns for image URL detection from discovered domains."""
     patterns = []
-
     for domain in sorted(domains):
         escaped_domain = re.escape(domain)
         patterns.append(
             re.compile(rf'https?://(?:www\.)?{escaped_domain}/wp-content/uploads/[^\s"\'<>]+', re.IGNORECASE)
         )
-
-    # Always match localhost
     patterns.append(
         re.compile(r'http://localhost(?::\d+)?/wp-content/uploads/[^\s"\'<>]+', re.IGNORECASE)
     )
-
-    # Generic fallback: any URL with /wp-content/uploads/
     patterns.append(
         re.compile(r'https?://[^\s"\'<>]+/wp-content/uploads/[^\s"\'<>]+', re.IGNORECASE)
     )
-
     return patterns
 
 
 def build_normalize_url_func(domains):
     """Build a function that normalizes localhost/variant URLs to a downloadable domain."""
-    # Pick the first non-localhost domain as the canonical download domain
     canonical_domain = None
     for domain in sorted(domains):
         if domain not in ("localhost", "127.0.0.1"):
@@ -145,13 +157,11 @@ def build_normalize_url_func(domains):
     def normalize_image_url(url):
         if not canonical_domain:
             return url
-        # Replace localhost URLs with canonical domain
-        normalized = re.sub(
+        return re.sub(
             r'http://localhost(?::\d+)?/wp-content/uploads/',
             f'https://{canonical_domain}/wp-content/uploads/',
             url,
         )
-        return normalized
 
     return normalize_image_url
 
@@ -163,6 +173,7 @@ def parse_items(tree):
     pages = []
     attachments = {}
 
+    skipped_types = {}
     for item in channel.findall("item"):
         post_type = get_text(item, "wp:post_type")
 
@@ -174,6 +185,7 @@ def parse_items(tree):
             continue
 
         if post_type not in ("post", "page"):
+            skipped_types[post_type] = skipped_types.get(post_type, 0) + 1
             continue
 
         categories = []
@@ -206,10 +218,18 @@ def parse_items(tree):
             "comments": comments,
         }
 
+        category_names = [c["name"] for c in categories if c["domain"] == "category"]
+        cat_str = f" [{', '.join(category_names)}]" if category_names else ""
+        comment_str = f" ({len(comments)} comments)" if comments else ""
+        log(f"  {post_type.upper()}: {entry['title']} [{entry['status']}]{cat_str}{comment_str}")
+
         if post_type == "post":
             posts.append(entry)
         else:
             pages.append(entry)
+
+    if skipped_types:
+        log(f"  Skipped types: {', '.join(f'{t} ({n})' for t, n in sorted(skipped_types.items()))}")
 
     return posts, pages, attachments
 
@@ -234,45 +254,56 @@ def download_images(all_urls, session, output_dir, normalize_image_url):
     url_map = {}
     failed = []
 
-    unique_urls = sorted(set(all_urls.keys()))
-    total = len(unique_urls)
+    # Deduplicate by normalized download URL so each file is only fetched once
+    seen_targets = {}
+    download_plan = []
+
+    for original_url in sorted(all_urls.keys()):
+        download_url = normalize_image_url(original_url)
+        local_path = url_to_local_path(download_url)
+        url_map[original_url] = str(local_path)
+
+        if download_url not in seen_targets:
+            seen_targets[download_url] = local_path
+            download_plan.append((original_url, download_url, local_path))
+
+    total = len(download_plan)
     downloaded_count = 0
     skipped_count = 0
 
     print(f"\nDownloading {total} unique images...")
 
-    for i, original_url in enumerate(unique_urls, 1):
-        download_url = normalize_image_url(original_url)
-        local_path = url_to_local_path(download_url)
+    for i, (original_url, download_url, local_path) in enumerate(download_plan, 1):
         full_local_path = output_dir / local_path
-        url_map[original_url] = str(local_path)
 
         if full_local_path.exists() and full_local_path.stat().st_size > 0:
             skipped_count += 1
-            if i % 100 == 0 or i == total:
-                print(f"  [{i}/{total}] Skipped (exists): {local_path.name}")
+            log(f"  [{i}/{total}] Skipped (exists): {full_local_path}")
+            progress_bar(i, total, prefix="Images")
             continue
 
         full_local_path.parent.mkdir(parents=True, exist_ok=True)
 
         try:
+            log(f"  [{i}/{total}] Downloading: {download_url}")
             response = session.get(download_url, timeout=IMAGE_DOWNLOAD_TIMEOUT, stream=True)
             response.raise_for_status()
             with open(full_local_path, "wb") as f:
                 for chunk in response.iter_content(chunk_size=8192):
                     f.write(chunk)
+            file_size = full_local_path.stat().st_size
             downloaded_count += 1
-            if i % 50 == 0 or i == total:
-                print(f"  [{i}/{total}] Downloaded: {local_path.name}")
+            log(f"  [{i}/{total}] OK ({file_size:,} bytes): {local_path.name}")
         except Exception as e:
             error_msg = str(e)
             if hasattr(e, "response") and e.response is not None:
                 error_msg = f"HTTP {e.response.status_code}: {e}"
             failed.append((original_url, error_msg, all_urls[original_url]))
-            if i % 50 == 0 or i == total:
-                print(f"  [{i}/{total}] FAILED: {local_path.name} - {error_msg}")
+            log(f"  [{i}/{total}] FAILED: {local_path.name} - {error_msg}")
 
-    print(f"\nImage download summary: {downloaded_count} downloaded, {skipped_count} skipped (existed), {len(failed)} failed")
+        progress_bar(i, total, prefix="Images")
+
+    print(f"  Summary: {downloaded_count} downloaded, {skipped_count} skipped, {len(failed)} failed")
     return url_map, failed, {"total": total, "downloaded": downloaded_count, "skipped": skipped_count, "failed_count": len(failed)}
 
 
@@ -292,14 +323,72 @@ def rewrite_image_urls(html_content, url_map, depth, image_patterns):
     return result
 
 
-# --- HTML Generation ---
-BULMA_CDN = "https://cdn.jsdelivr.net/npm/bulma@1.0.4/css/bulma.min.css"
+# --- Internal Link Rewriting ---
+def build_slug_map(posts, pages):
+    """Build a mapping from WP slugs to local static paths."""
+    slug_map = {}
+    for entry in pages:
+        slug = entry["post_name"] or entry["post_id"]
+        slug_map[slug] = f"pages/{slug}.html"
+    for entry in posts:
+        slug = entry["post_name"] or entry["post_id"]
+        slug_map[slug] = f"posts/{slug}.html"
+    return slug_map
 
-STATUS_CLASSES = {
-    "draft": "is-warning is-light",
-    "private": "is-danger is-light",
-    "pending": "is-info is-light",
-    "inherit": "is-light",
+
+def build_internal_link_patterns(domains):
+    """Build regex patterns to match internal links."""
+    patterns = []
+    for domain in sorted(domains):
+        escaped_domain = re.escape(domain)
+        patterns.append(
+            re.compile(
+                rf'href=["\']https?://(?:www\.)?{escaped_domain}(/[^\s"\'<>]*)["\']',
+                re.IGNORECASE,
+            )
+        )
+    patterns.append(
+        re.compile(
+            r'href=["\']http://localhost(?::\d+)?(/[^\s"\'<>]*)["\']',
+            re.IGNORECASE,
+        )
+    )
+    return patterns
+
+
+def rewrite_internal_links(html_content, slug_map, internal_link_patterns, depth):
+    """Rewrite internal WP links to local static paths."""
+    prefix = "../" * depth
+    rewrites = 0
+
+    def replacer(match):
+        nonlocal rewrites
+        path = match.group(1)
+        clean_path = path.strip("/")
+        if clean_path in slug_map:
+            rewrites += 1
+            return f'href="{prefix}{slug_map[clean_path]}"'
+        segments = [s for s in clean_path.split("/") if s]
+        if segments:
+            last_segment = segments[-1]
+            if "." in last_segment and not last_segment.endswith(".html"):
+                return match.group(0)
+            if last_segment in slug_map:
+                rewrites += 1
+                return f'href="{prefix}{slug_map[last_segment]}"'
+        return match.group(0)
+
+    result = html_content
+    for pattern in internal_link_patterns:
+        result = pattern.sub(replacer, result)
+    return result, rewrites
+
+
+# --- HTML Generation ---
+STATUS_TAG_CLASSES = {
+    "draft": "tag-draft",
+    "private": "tag-private",
+    "pending": "tag-pending",
 }
 
 
@@ -313,38 +402,45 @@ def escape_html(text):
     return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace('"', "&quot;")
 
 
-def status_badge(status):
+def status_badge(status, plain=False):
     if status == "publish":
         return ""
-    classes = STATUS_CLASSES.get(status, "is-light")
-    return f' <span class="tag {classes}">{escape_html(status)}</span>'
+    if plain:
+        return f" [{status}]"
+    tag_class = STATUS_TAG_CLASSES.get(status, "tag-default")
+    return f' <span class="tag {tag_class}">{escape_html(status)}</span>'
 
 
-def generate_item_html(entry, url_map, site_title, language, image_patterns):
+def generate_item_html(entry, url_map, site_title, language, image_patterns, slug_map, internal_link_patterns, plain=False):
     post_type = entry["post_type"]
     content = rewrite_image_urls(entry["content"], url_map, depth=1, image_patterns=image_patterns)
+    content, link_rewrites = rewrite_internal_links(content, slug_map, internal_link_patterns, depth=1)
+    if link_rewrites:
+        log(f"    Rewrote {link_rewrites} internal link(s)")
+
+    date_display = entry["post_date"][:10] if entry["post_date"] else ""
+    title_escaped = escape_html(entry["title"])
+
+    if plain:
+        return _item_html_plain(entry, content, site_title, language, date_display, title_escaped)
 
     categories_html = ""
     content_categories = [c for c in entry["categories"] if c["domain"] == "category"]
     if content_categories:
-        tag_spans = "".join(f'<span class="tag is-info is-light">{escape_html(c["name"])}</span>' for c in content_categories)
-        categories_html = f'<div class="tags">{tag_spans}</div>'
+        tags = "".join(f'<span class="tag tag-category">{escape_html(c["name"])}</span>' for c in content_categories)
+        categories_html = f'<div class="categories">{tags}</div>'
 
     comments_html = ""
     if entry["comments"]:
-        comment_blocks = []
+        blocks = []
         for comment in entry["comments"]:
-            comment_blocks.append(
-                f'<div class="box comment-box">'
-                f'<p><strong>{escape_html(comment["author"])}</strong> '
-                f'<small class="has-text-grey">{escape_html(comment["date"])}</small></p>'
+            blocks.append(
+                f'<div class="comment">'
+                f'<div class="comment-meta"><strong>{escape_html(comment["author"])}</strong> &middot; {escape_html(comment["date"])}</div>'
                 f'<div>{comment["content"]}</div>'
                 f'</div>'
             )
-        comments_html = f'<h2 class="title is-4">Comments</h2>{"".join(comment_blocks)}'
-
-    date_display = entry["post_date"][:10] if entry["post_date"] else ""
-    title_escaped = escape_html(entry["title"])
+        comments_html = f'<h2>Comments</h2>{"".join(blocks)}'
 
     return f"""<!DOCTYPE html>
 <html lang="{escape_html(language)}">
@@ -352,43 +448,102 @@ def generate_item_html(entry, url_map, site_title, language, image_patterns):
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>{title_escaped} - {escape_html(site_title)}</title>
-<link rel="stylesheet" href="{BULMA_CDN}">
 <link rel="stylesheet" href="../style.css">
 </head>
 <body>
-<section class="section">
+<div class="section">
 <div class="container">
-<nav class="breadcrumb" aria-label="breadcrumbs">
-<ul>
-<li><a href="../index.html">{escape_html(site_title)}</a></li>
-<li><a href="../index.html">{escape_html(post_type.title())}s</a></li>
-<li class="is-active"><a href="#" aria-current="page">{title_escaped}</a></li>
-</ul>
-</nav>
-<h1 class="title">{title_escaped}</h1>
-<p class="subtitle is-6 has-text-grey">
+<div class="breadcrumb">
+<a href="../index.html">{escape_html(site_title)}</a> <span>/</span>
+<a href="../index.html">{escape_html(post_type.title())}s</a> <span>/</span>
+{title_escaped}
+</div>
+<h1>{title_escaped}</h1>
+<div class="meta">
 {escape_html(date_display)} &middot; by {escape_html(entry["creator"] or "admin")} &middot; {escape_html(post_type)}{status_badge(entry["status"])}
-</p>
+</div>
 {categories_html}
 <div class="content">
 {content}
 </div>
 {comments_html}
 </div>
-</section>
+</div>
 </body>
 </html>"""
 
 
-def generate_index_html(posts, pages, site_title, site_description, language):
+def _item_html_plain(entry, content, site_title, language, date_display, title_escaped):
+    """Generate a plain HTML page with no CSS or JS."""
+    post_type = entry["post_type"]
+    categories = [c["name"] for c in entry["categories"] if c["domain"] == "category"]
+    cat_str = ", ".join(escape_html(c) for c in categories)
+    cat_line = f"<p><em>Categories: {cat_str}</em></p>" if cat_str else ""
+
+    comments_html = ""
+    if entry["comments"]:
+        items = []
+        for comment in entry["comments"]:
+            items.append(
+                f'<li><strong>{escape_html(comment["author"])}</strong> '
+                f'({escape_html(comment["date"])})<br>{comment["content"]}</li>'
+            )
+        comments_html = f'<h2>Comments</h2><ul>{"".join(items)}</ul>'
+
+    status_str = f" [{entry['status']}]" if entry["status"] != "publish" else ""
+
+    return f"""<!DOCTYPE html>
+<html lang="{escape_html(language)}">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>{title_escaped} - {escape_html(site_title)}</title>
+</head>
+<body>
+<p><a href="../index.html">&larr; {escape_html(site_title)}</a></p>
+<h1>{title_escaped}{status_str}</h1>
+<p><small>{escape_html(date_display)} | by {escape_html(entry["creator"] or "admin")} | {escape_html(post_type)}</small></p>
+{cat_line}
+<hr>
+{content}
+{comments_html}
+</body>
+</html>"""
+
+
+def generate_index_html(posts, pages, site_title, site_description, language, plain=False):
+    if plain:
+        return _index_html_plain(posts, pages, site_title, site_description, language)
+
+    all_categories = set()
+    all_statuses = set()
+    all_authors = set()
+    for entry in posts + pages:
+        all_statuses.add(entry["status"])
+        all_authors.add(entry["creator"] or "admin")
+        for cat in entry["categories"]:
+            if cat["domain"] == "category":
+                all_categories.add(cat["name"])
+
     def item_row(entry, folder):
         slug = entry["post_name"] or entry["post_id"]
         href = f"{folder}/{slug}.html"
         date_str = entry["post_date"][:10] if entry["post_date"] else ""
         badge = status_badge(entry["status"])
+        entry_categories = [c["name"] for c in entry["categories"] if c["domain"] == "category"]
+        data_cats = escape_html(",".join(entry_categories))
+        data_status = escape_html(entry["status"])
+        data_type = escape_html(entry["post_type"])
+        data_author = escape_html(entry["creator"] or "admin")
+        cat_tags = "".join(
+            f'<span class="tag tag-category">{escape_html(c)}</span>'
+            for c in entry_categories
+        )
         return (
-            f'<a class="panel-block" href="{href}">'
-            f'<span class="is-flex-grow-1">{escape_html(entry["title"])}{badge}</span>'
+            f'<a class="item-row" href="{href}" '
+            f'data-type="{data_type}" data-status="{data_status}" '
+            f'data-category="{data_cats}" data-author="{data_author}">'
+            f'<span class="item-title">{escape_html(entry["title"])}{badge}{cat_tags}</span>'
             f'<span class="item-date">{escape_html(date_str)}</span>'
             f'</a>'
         )
@@ -396,10 +551,23 @@ def generate_index_html(posts, pages, site_title, site_description, language):
     sorted_pages = sorted(pages, key=lambda x: x["post_date"] or "", reverse=True)
     sorted_posts = sorted(posts, key=lambda x: x["post_date"] or "", reverse=True)
 
-    pages_list = "\n".join(item_row(page, "pages") for page in sorted_pages)
-    posts_list = "\n".join(item_row(post, "posts") for post in sorted_posts)
+    all_items = [(p, "pages") for p in sorted_pages] + [(p, "posts") for p in sorted_posts]
+    items_html = "\n".join(item_row(entry, folder) for entry, folder in all_items)
 
     subtitle_text = f"{escape_html(site_description)} &mdash; Static Export" if site_description else "Static Export"
+
+    category_options = "".join(
+        f'<option value="{escape_html(c)}">{escape_html(c)}</option>'
+        for c in sorted(all_categories)
+    )
+    status_options = "".join(
+        f'<option value="{escape_html(s)}">{escape_html(s)}</option>'
+        for s in sorted(all_statuses)
+    )
+    author_options = "".join(
+        f'<option value="{escape_html(a)}">{escape_html(a)}</option>'
+        for a in sorted(all_authors)
+    )
 
     return f"""<!DOCTYPE html>
 <html lang="{escape_html(language)}">
@@ -407,58 +575,172 @@ def generate_index_html(posts, pages, site_title, site_description, language):
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>{escape_html(site_title)}</title>
-<link rel="stylesheet" href="{BULMA_CDN}">
 <link rel="stylesheet" href="style.css">
 </head>
 <body>
-<section class="hero is-link">
-<div class="hero-body">
+<div class="hero">
 <div class="container">
-<p class="title">{escape_html(site_title)}</p>
-<p class="subtitle">{subtitle_text}</p>
+<h1>{escape_html(site_title)}</h1>
+<p>{subtitle_text}</p>
 </div>
 </div>
-</section>
 
-<section class="section">
+<div class="section">
 <div class="container">
 
-<nav class="panel">
-<p class="panel-heading">Pages ({len(pages)})</p>
-{pages_list}
-</nav>
+<div class="filter-bar">
+<input type="text" id="search" placeholder="Search titles...">
+<div class="filter-row">
+<div class="filter-group">
+<label>Type</label>
+<select id="filter-type">
+<option value="">All types</option>
+<option value="page">Pages</option>
+<option value="post">Posts</option>
+</select>
+</div>
+<div class="filter-group">
+<label>Status</label>
+<select id="filter-status">
+<option value="">All statuses</option>
+{status_options}
+</select>
+</div>
+<div class="filter-group">
+<label>Category</label>
+<select id="filter-category">
+<option value="">All categories</option>
+{category_options}
+</select>
+</div>
+<div class="filter-group">
+<label>Author</label>
+<select id="filter-author">
+<option value="">All authors</option>
+{author_options}
+</select>
+</div>
+</div>
+</div>
 
-<nav class="panel">
-<p class="panel-heading">Posts ({len(posts)})</p>
-{posts_list}
-</nav>
+<div class="content-list">
+<div class="content-list-header">
+All Content <span class="count" id="count-badge">{len(posts) + len(pages)}</span>
+</div>
+{items_html}
+<div class="no-results" id="no-results">No items match your filters.</div>
+</div>
 
 </div>
-</section>
-
-<footer class="footer">
-<div class="content has-text-centered">
-<p>Generated by <strong>wp2static</strong></p>
 </div>
-</footer>
+
+<div class="footer">Generated by <strong>wp2static</strong></div>
+
+<script>
+(function() {{
+  var search = document.getElementById('search');
+  var filterType = document.getElementById('filter-type');
+  var filterStatus = document.getElementById('filter-status');
+  var filterCategory = document.getElementById('filter-category');
+  var filterAuthor = document.getElementById('filter-author');
+  var rows = document.querySelectorAll('.item-row');
+  var noResults = document.getElementById('no-results');
+  var countBadge = document.getElementById('count-badge');
+
+  function applyFilters() {{
+    var query = search.value.toLowerCase();
+    var typeVal = filterType.value;
+    var statusVal = filterStatus.value;
+    var catVal = filterCategory.value;
+    var authorVal = filterAuthor.value;
+    var visible = 0;
+
+    rows.forEach(function(row) {{
+      var title = row.textContent.toLowerCase();
+      var ok = (!query || title.indexOf(query) !== -1)
+        && (!typeVal || row.dataset.type === typeVal)
+        && (!statusVal || row.dataset.status === statusVal)
+        && (!catVal || row.dataset.category.split(',').indexOf(catVal) !== -1)
+        && (!authorVal || row.dataset.author === authorVal);
+
+      row.style.display = ok ? '' : 'none';
+      if (ok) visible++;
+    }});
+
+    countBadge.textContent = visible;
+    noResults.style.display = visible === 0 ? 'block' : 'none';
+  }}
+
+  search.addEventListener('input', applyFilters);
+  filterType.addEventListener('change', applyFilters);
+  filterStatus.addEventListener('change', applyFilters);
+  filterCategory.addEventListener('change', applyFilters);
+  filterAuthor.addEventListener('change', applyFilters);
+}})();
+</script>
 </body>
 </html>"""
 
 
-def write_report(posts, pages, image_stats, failed_images, output_dir, site_title):
+def _index_html_plain(posts, pages, site_title, site_description, language):
+    """Generate a plain HTML index with no CSS or JS."""
+
+    def item_li(entry, folder):
+        slug = entry["post_name"] or entry["post_id"]
+        href = f"{folder}/{slug}.html"
+        date_str = entry["post_date"][:10] if entry["post_date"] else ""
+        status_str = f" [{entry['status']}]" if entry["status"] != "publish" else ""
+        date_part = f" <small>({date_str})</small>" if date_str else ""
+        return f'<li><a href="{href}">{escape_html(entry["title"])}</a>{status_str}{date_part}</li>'
+
+    sorted_pages = sorted(pages, key=lambda x: x["post_date"] or "", reverse=True)
+    sorted_posts = sorted(posts, key=lambda x: x["post_date"] or "", reverse=True)
+
+    pages_list = "\n".join(item_li(p, "pages") for p in sorted_pages)
+    posts_list = "\n".join(item_li(p, "posts") for p in sorted_posts)
+
+    desc = f"<p>{escape_html(site_description)}</p>" if site_description else ""
+
+    return f"""<!DOCTYPE html>
+<html lang="{escape_html(language)}">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>{escape_html(site_title)}</title>
+</head>
+<body>
+<h1>{escape_html(site_title)}</h1>
+{desc}
+<h2>Pages ({len(pages)})</h2>
+<ul>
+{pages_list}
+</ul>
+<h2>Posts ({len(posts)})</h2>
+<ul>
+{posts_list}
+</ul>
+<hr>
+<p><small>Generated by wp2static</small></p>
+</body>
+</html>"""
+
+
+def write_report(posts, pages, image_stats, failed_images, link_stats, output_dir, site_title):
     lines = [
         f"{'='*60}",
         f"  {site_title} - WordPress Export Report",
         f"{'='*60}",
         f"",
-        f"Pages processed:  {len(pages)}",
-        f"Posts processed:  {len(posts)}",
-        f"Total items:      {len(pages) + len(posts)}",
+        f"Pages processed:    {len(pages)}",
+        f"Posts processed:    {len(posts)}",
+        f"Total items:        {len(pages) + len(posts)}",
         f"",
         f"Images found:       {image_stats['total']}",
         f"Images downloaded:  {image_stats['downloaded']}",
         f"Images skipped:     {image_stats['skipped']} (already existed)",
         f"Images failed:      {image_stats['failed_count']}",
+        f"",
+        f"Internal links rewritten: {link_stats}",
     ]
 
     if failed_images:
@@ -488,6 +770,8 @@ def write_report(posts, pages, image_stats, failed_images, output_dir, site_titl
 
 # --- Main ---
 def main():
+    global VERBOSE
+
     parser = argparse.ArgumentParser(
         prog="wp2static",
         description="Convert a WordPress WXR export to a static HTML site.",
@@ -496,10 +780,14 @@ def main():
     )
     parser.add_argument("input", nargs="?", help="Path to WXR XML export file")
     parser.add_argument("-o", "--output", default="./output", help="Output directory (default: ./output)")
-    parser.add_argument("--skip-images", action="store_true", help="Skip downloading images")
+    parser.add_argument("--skip-images", action="store_true", help="Skip downloading images (generate HTML only)")
+    parser.add_argument("--download-only", action="store_true", help="Only download missing images, skip HTML generation")
+    parser.add_argument("--plain", action="store_true", help="Generate plain HTML without any CSS or JS")
+    parser.add_argument("-v", "--verbose", action="store_true", help="Enable verbose logging")
     parser.add_argument("--help-export", action="store_true", help="Show how to export from WordPress")
 
     args = parser.parse_args()
+    VERBOSE = args.verbose
 
     if args.help_export:
         print(HELP_EXPORT_TEXT)
@@ -516,6 +804,18 @@ def main():
     print(BANNER)
     print()
 
+    if args.skip_images and args.download_only:
+        print("Error: --skip-images and --download-only cannot be used together.")
+        sys.exit(1)
+
+    plain = args.plain
+    download_only = args.download_only
+
+    if download_only:
+        print("Mode: download missing images only (no HTML generation)")
+    elif plain:
+        print("Mode: plain HTML (no CSS, no JavaScript)")
+
     xml_file = args.input
     output_dir = Path(args.output)
 
@@ -523,10 +823,10 @@ def main():
         print(f"Error: file not found: {xml_file}")
         sys.exit(1)
 
-    print(f"Parsing {xml_file}...")
+    file_size = os.path.getsize(xml_file)
+    print(f"Parsing {xml_file} ({file_size:,} bytes)...")
     tree = ET.parse(xml_file)
 
-    # Auto-detect site metadata
     metadata = detect_site_metadata(tree)
     site_title = metadata["title"]
     site_description = metadata["description"]
@@ -534,18 +834,21 @@ def main():
     domains = metadata["domains"]
 
     print(f"Detected site: {site_title}")
-    print(f"Language: {language}")
-    print(f"Description: {site_description or '(none)'}")
+    log(f"  Language: {language}")
+    log(f"  Description: {site_description or '(none)'}")
     print(f"Domains found: {', '.join(sorted(domains)) or '(none)'}")
 
-    # Build image URL patterns from discovered domains
     image_patterns = build_image_patterns(domains)
     normalize_image_url = build_normalize_url_func(domains)
+    internal_link_patterns = build_internal_link_patterns(domains)
 
+    print(f"\nParsing items...")
     posts, pages, attachments = parse_items(tree)
     print(f"Found {len(posts)} posts, {len(pages)} pages, {len(attachments)} attachments")
 
-    # Collect all image URLs
+    slug_map = build_slug_map(posts, pages)
+    log(f"  Built slug map with {len(slug_map)} entries")
+
     all_image_urls = {}
     for entry in posts + pages:
         if not entry["content"]:
@@ -558,15 +861,12 @@ def main():
 
     print(f"Found {len(all_image_urls)} unique image URLs in content")
 
-    # Create output directories
-    (output_dir / "posts").mkdir(parents=True, exist_ok=True)
-    (output_dir / "pages").mkdir(parents=True, exist_ok=True)
-    (output_dir / "images").mkdir(parents=True, exist_ok=True)
+    log(f"\nCreating output directories in {output_dir.resolve()}...")
+    for subdir in ("posts", "pages", "images"):
+        (output_dir / subdir).mkdir(parents=True, exist_ok=True)
+        log(f"  {output_dir / subdir}/")
 
-    # Copy style.css to output
-    copy_style_css(output_dir)
-
-    # Download images
+    # --- Image downloading ---
     url_map = {}
     failed_images = []
     image_stats = {"total": 0, "downloaded": 0, "skipped": 0, "failed_count": 0}
@@ -578,31 +878,52 @@ def main():
         session = create_session()
         url_map, failed_images, image_stats = download_images(all_image_urls, session, output_dir, normalize_image_url)
 
-    # Generate individual HTML pages
-    print("\nGenerating HTML pages...")
+    if download_only:
+        print(f"\n  Download-only mode: skipping HTML generation.")
+        write_report(posts, pages, image_stats, failed_images, 0, output_dir, site_title)
+        return
+
+    # --- HTML generation ---
+    if not plain:
+        copy_style_css(output_dir)
+        log(f"  Copied style.css")
+
+    total_items = len(pages) + len(posts)
+    total_link_rewrites = 0
+    print(f"\nGenerating {total_items} HTML files...")
+    item_counter = 0
+
     for entry in pages:
         slug = entry["post_name"] or entry["post_id"]
         filename = output_dir / "pages" / f"{slug}.html"
-        html = generate_item_html(entry, url_map, site_title, language, image_patterns)
+        html = generate_item_html(entry, url_map, site_title, language, image_patterns, slug_map, internal_link_patterns, plain=plain)
         filename.write_text(html, encoding="utf-8")
-
-    print(f"  Generated {len(pages)} page files in {output_dir}/pages/")
+        log(f"  Page: {filename.name} ({entry['title']})")
+        item_counter += 1
+        progress_bar(item_counter, total_items, prefix="HTML  ")
 
     for entry in posts:
         slug = entry["post_name"] or entry["post_id"]
         filename = output_dir / "posts" / f"{slug}.html"
-        html = generate_item_html(entry, url_map, site_title, language, image_patterns)
+        html = generate_item_html(entry, url_map, site_title, language, image_patterns, slug_map, internal_link_patterns, plain=plain)
         filename.write_text(html, encoding="utf-8")
+        log(f"  Post: {filename.name} ({entry['title']})")
+        item_counter += 1
+        progress_bar(item_counter, total_items, prefix="HTML  ")
 
-    print(f"  Generated {len(posts)} post files in {output_dir}/posts/")
-
-    # Generate index
-    index_html = generate_index_html(posts, pages, site_title, site_description, language)
+    index_html = generate_index_html(posts, pages, site_title, site_description, language, plain=plain)
     (output_dir / "index.html").write_text(index_html, encoding="utf-8")
-    print(f"  Generated {output_dir}/index.html")
+    print(f"  Index: {output_dir}/index.html")
 
-    # Report
-    write_report(posts, pages, image_stats, failed_images, output_dir, site_title)
+    for entry in posts + pages:
+        if entry["content"]:
+            _, rewrites = rewrite_internal_links(entry["content"], slug_map, internal_link_patterns, depth=1)
+            total_link_rewrites += rewrites
+
+    if total_link_rewrites:
+        print(f"  Rewrote {total_link_rewrites} internal link(s) across all content")
+
+    write_report(posts, pages, image_stats, failed_images, total_link_rewrites, output_dir, site_title)
 
 
 if __name__ == "__main__":
